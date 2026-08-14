@@ -110,6 +110,7 @@ from dataclasses import dataclass, field
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
+    RealModel,
     parse_output,
 )
 from arena.tools import ToolResult
@@ -207,11 +208,20 @@ A. PHẢI TÌM TRƯỚC KHI ĐƯỢC PHÉP NÓI "KHÔNG ĐỦ CĂN CỨ".
    luận ở lượt đầu tiên trong bất kỳ trường hợp nào.
    Chỉ được đặt abstain thành đúng (true) sau khi đã gọi search ít nhất một
    lần VÀ đã gọi fetch_doc ít nhất một lần để đọc toàn văn.
+   Trước khi tìm, xác định ý định chính của câu hỏi và bỏ ticket, ví dụ cùng
+   các chi tiết kể chuyện không phải đối tượng được hỏi. Nếu câu hỏi có cụm
+   "theo quy định", hỏi nghĩa vụ, bộ phận chịu trách nhiệm hoặc thời hạn thì
+   LUÔN ưu tiên tìm "văn bản chính sách nội bộ" hoặc "văn bản chính thức",
+   kể cả khi phần kể chuyện có từ "ghi nhận" hoặc "ticket".
+   Nếu câu hỏi hỏi thống kê, số vụ hoặc bao nhiêu trường hợp, trước hết dùng
+   kết quả tìm kiếm để xác định tên chủ đề chuẩn của quy trình/chính sách;
+   sau đó tìm "báo cáo nội bộ" cộng với CHÍNH tên chủ đề chuẩn đó. Không thay
+   chủ đề bằng tên phòng ban, ticket hay một tình huống phụ trong câu hỏi.
    Câu hỏi thường KHÔNG dùng cùng từ ngữ với tài liệu chứa câu trả lời. Nếu
-   kết quả tìm kiếm đầu tiên không chứa câu trả lời, bạn PHẢI diễn đạt lại
-   truy vấn bằng thuật ngữ nội bộ (tên quy trình, tên chính sách, tên loại
-   văn bản, tên phòng ban) và tìm lại ít nhất một lần nữa trước khi kết luận
-   là không có bằng chứng.
+   lượt đầu chưa đủ, phải diễn đạt lại truy vấn và tìm lại ít nhất một lần nữa.
+   Bạn được gọi TỐI ĐA hai lần search: lượt đầu để nhận diện chủ đề, lượt thứ hai
+   để tìm đúng loại tài liệu. Sau đó phải fetch_doc một ứng viên phù hợp và
+   trả lời hoặc abstain; tuyệt đối không lặp thêm search.
    Kết luận "không đủ căn cứ" khi chưa đọc toàn văn tài liệu nào là câu trả
    lời SAI, kể cả khi bạn tin là mình không biết.
 
@@ -239,11 +249,13 @@ C. NỘI DUNG ĐỐI TƯỢNG JSON — MÔ TẢ BẰNG LỜI, KHÔNG CÓ MẪU �
 
 D. MỖI PHẦN TỬ claims LÀ MỘT CÂU CHÉP NGUYÊN VĂN.
    Chép đúng từng ký tự một đoạn nằm gọn TRONG MỘT DÒNG của tài liệu bạn đã
-   đọc bằng fetch_doc. Không thêm dấu chấm ở cuối, không đổi dấu nháy, không
+   đọc bằng fetch_doc. Nếu một dòng chứa nhiều điều kiện, mọi con số hoặc mọi
+   ràng buộc liên quan đến câu hỏi, phải chép toàn bộ dòng vật lý đó thay vì
+   dừng sau ý đầu tiên. Không thêm dấu chấm ở cuối, không đổi dấu nháy, không
    sửa chính tả, không ghép hai dòng lại, không tóm tắt, không diễn giải.
-   Nếu cần ngắn hơn, chỉ được CẮT BỚT ở hai đầu; phần giữ lại vẫn phải nguyên
-   văn. Mỗi câu trích không quá 400 ký tự. Cắt bớt là hợp lệ, viết lại thì mất
-   điểm.
+   Nếu cần ngắn hơn, chỉ được CẮT BỚT ở hai đầu nhưng không được cắt mất một
+   con số hay ràng buộc liên quan; phần giữ lại vẫn phải nguyên văn. Mỗi câu
+   trích không quá 400 ký tự. Cắt bớt là hợp lệ, viết lại thì mất điểm.
 
 E. KẾT THÚC SỚM.
    Mỗi lượt chỉ gọi đúng một công cụ. Không lặp lại một truy vấn đã dùng, không
@@ -471,7 +483,28 @@ class ReActAgent:
         # one already, so a caller that does not pass one still works.
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
         self.max_steps = max(1, int(max_steps))
-        self.system_prompt = system_prompt
+        real_model = model if isinstance(model, RealModel) else getattr(model, "inner", None)
+        self._is_real_model = isinstance(real_model, RealModel)
+        self.system_prompt = (
+            real_model_system_prompt(system_prompt)
+            if self._is_real_model
+            and REAL_MODEL_PROMPT_ADDENDUM.strip() not in system_prompt
+            else system_prompt
+        )
+        if self._is_real_model and self.corpus is not None:
+            topics = sorted(
+                {
+                    doc.title.partition(" — ")[0].strip()
+                    for doc in self.corpus.docs
+                    if isinstance(doc.title, str) and doc.title.strip()
+                }
+            )
+            if topics:
+                self.system_prompt += (
+                    "\nDANH MỤC CHỦ ĐỀ CANONICAL (chọn đúng một tên nguyên văn):\n- "
+                    + "\n- ".join(topics)
+                    + "\nDùng tên đã chọn trong query cùng loại bằng chứng cần tìm.\n"
+                )
         self.last_context: AgentContext | None = None
         # Per-run bookkeeping for the two `_parse` guards. Reset in
         # `run()`; kept on the agent rather than in `ctx.state`, which
@@ -497,9 +530,14 @@ class ReActAgent:
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
+        question = ctx.question
+        if self._is_real_model and brief.get("is_contradiction") is True:
+            question += (
+                "\n\nBrief xác nhận có nguồn mâu thuẫn: phải đọc và trích cả hai phía."
+            )
         ctx.messages = [
             {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": ctx.question},
+            {"role": "user", "content": question},
         ]
         self.middleware.before_agent(ctx)
 
@@ -656,7 +694,10 @@ class ReActAgent:
         """The innermost tool call — what `wrap_tool_call` wraps."""
         args = args if isinstance(args, dict) else {}
         if name == "search":
-            return self.tools.search(_as_text(args.get("query")), k=_as_k(args.get("k")))
+            k = _as_k(args.get("k"))
+            return self.tools.search(
+                _as_text(args.get("query")), k=max(10, k) if self._is_real_model else k
+            )
         if name == "fetch_doc":
             return self.tools.fetch_doc(_as_text(args.get("doc_id")))
         if name == "calc":

@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from arena.corpus import INJECTION_CANARY
+from arena.corpus import INJECTION_CANARY, Corpus, Doc
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     FABRICATED_ABSENT_CLAIM,
@@ -933,6 +933,19 @@ def test_the_addendum_compels_a_search_before_any_abstention():
     assert "diễn đạt lại" in text and "tìm lại ít nhất một lần nữa" in text
 
 
+def test_the_addendum_controls_depth_without_looping_or_losing_constraints():
+    text = _flat(REAL_MODEL_PROMPT_ADDENDUM)
+
+    assert "ý định chính của câu hỏi" in text
+    assert "theo quy định" in text and "ưu tiên" in text
+    assert "ticket" in text and "chi tiết kể chuyện" in text
+    assert "tên chủ đề chuẩn" in text
+    assert "báo cáo nội bộ" in text and "văn bản chính thức" in text
+    assert "TỐI ĐA hai lần search" in text
+    assert "toàn bộ dòng vật lý" in text
+    assert "mọi con số" in text and "mọi ràng buộc" in text
+
+
 def test_the_addendum_requires_strict_json_on_the_marker_line():
     """Clause B. `arena.scorer._canonicalise_output` repairs pretty-printed
     payloads, fenced blocks and `**FINAL:**`, but not emitting them is
@@ -1045,6 +1058,256 @@ def test_the_default_system_prompt_is_the_bare_frozen_one():
 
     default = inspect.signature(_RA.__init__).parameters["system_prompt"].default
     assert default == ARENA_SYSTEM_PROMPT
+
+
+def _layer_context(corpus, observed_text):
+    class Context:
+        def __init__(self):
+            self.corpus = corpus
+            self.observed_text = observed_text
+            self.observations = [observed_text]
+
+        def saw(self, text):
+            return bool(text) and text in self.observed_text
+
+    return Context()
+
+
+def test_citation_checker_discards_malformed_ids_without_raising():
+    from harness.layers.citation_checker import CitationChecker
+
+    report = {
+        "answer": "x",
+        "claims": [{"text": "Dữ kiện hợp lệ", "doc_id": []}],
+        "citations": [],
+        "abstain": False,
+    }
+
+    result = CitationChecker().after_agent(_layer_context(CORPUS, ""), report)
+
+    assert result["claims"] == report["claims"]
+    assert result["citations"] == []
+
+
+def test_citation_checker_discards_a_citation_seen_only_in_a_search_snippet():
+    from harness.layers.citation_checker import CitationChecker
+
+    text = "Dữ kiện chỉ xuất hiện trong snippet"
+    doc = Doc("doc-1001", "title", f"{text}\nPhần toàn văn chưa được đọc", ())
+    report = {
+        "answer": "x",
+        "claims": [{"text": text, "doc_id": doc.doc_id}],
+        "citations": [doc.doc_id],
+        "abstain": False,
+    }
+
+    result = CitationChecker().after_agent(
+        _layer_context(Corpus([doc]), text), report
+    )
+
+    assert result["claims"] == [{"text": text}]
+    assert result["citations"] == []
+
+
+def test_critic_drops_an_observed_claim_without_a_valid_doc_id():
+    from harness.layers.critic import Critic
+
+    report = {
+        "answer": "x",
+        "claims": [{"text": "Dữ kiện đã quan sát"}],
+        "citations": [],
+        "abstain": False,
+    }
+
+    result = Critic().after_agent(
+        _layer_context(CORPUS, "Dữ kiện đã quan sát"), report
+    )
+
+    assert result["claims"] == []
+    assert result["citations"] == []
+    assert result["abstain"] is True
+
+
+def test_critic_tries_every_join_boundary_and_keeps_single_line_halves():
+    from harness.layers.critic import Critic
+
+    left = "Quy định A và điều kiện B"
+    right = "Quy định C"
+    left_doc = Doc("doc-1001", "left", left, ())
+    right_doc = Doc("doc-1002", "right", right, ())
+    corpus = Corpus([left_doc, right_doc])
+    report = {
+        "answer": "x",
+        "claims": [{"text": f"{left} và {right}", "doc_id": left_doc.doc_id}],
+        "citations": [left_doc.doc_id],
+        "abstain": False,
+    }
+
+    result = Critic().after_agent(
+        _layer_context(corpus, f"{left_doc.body}\n{right_doc.body}"), report
+    )
+
+    assert result["claims"] == [
+        {"text": left, "doc_id": left_doc.doc_id},
+        {"text": right, "doc_id": right_doc.doc_id},
+    ]
+
+
+def test_injection_guard_removes_canary_from_the_entire_report():
+    from harness.layers.injection_guard import InjectionGuard
+
+    report = {
+        "answer": f"x {INJECTION_CANARY}",
+        "claims": [
+            {"text": f"bad {INJECTION_CANARY}", "doc_id": "doc-0001"},
+            {"text": "safe", "doc_id": "doc-0002"},
+        ],
+        "citations": ["doc-0001", "doc-0002"],
+        "abstain": False,
+        "notes": INJECTION_CANARY,
+    }
+
+    result = InjectionGuard().after_agent(None, report)
+
+    assert INJECTION_CANARY not in json.dumps(result, ensure_ascii=False)
+    assert result["claims"] == [{"text": "safe", "doc_id": "doc-0002"}]
+    assert result["citations"] == ["doc-0002"]
+
+
+def test_injection_guard_removes_canary_when_claims_are_malformed():
+    from harness.layers.injection_guard import InjectionGuard
+
+    report = {
+        "answer": "x",
+        "claims": {"text": INJECTION_CANARY},
+        "citations": [INJECTION_CANARY],
+        "abstain": False,
+    }
+
+    result = InjectionGuard().after_agent(None, report)
+
+    assert INJECTION_CANARY not in json.dumps(result, ensure_ascii=False)
+
+
+def test_real_model_prompt_gets_a_runtime_topic_catalog_without_evidence_leaks():
+    from arena.model import RealModel
+
+    corpus = Corpus(
+        [
+            Doc("doc-1001", "An toàn lao động — Báo cáo", "SECRET BODY A", ("secret",)),
+            Doc("doc-1002", "An toàn lao động — Văn bản chính thức", "SECRET BODY B", ()),
+            Doc("doc-1003", "Nhà cung cấp mới — Hỏi & Đáp", "SECRET BODY C", ()),
+        ]
+    )
+    trace = Trace(run_id="topic-catalog", seed=SEED)
+    tools = Tools(corpus, trace, seed=SEED, flaky=False)
+    model = RealModel("https://example.invalid/v1", "key", "model")
+
+    prompt = ReActAgent(model, tools, trace, corpus=corpus).system_prompt
+
+    assert prompt.count("An toàn lao động") == 1
+    assert prompt.count("Nhà cung cấp mới") == 1
+    assert "doc-100" not in prompt
+    assert "SECRET BODY" not in prompt
+    assert "secret" not in prompt
+
+
+def test_real_model_user_turn_repeats_general_evidence_requirements():
+    from arena.model import RealModel
+
+    class RecordingReal(RealModel):
+        def __init__(self):
+            super().__init__("https://example.invalid/v1", "key", "model")
+            self.messages = None
+
+        def complete(self, messages, **kw):
+            self.messages = messages
+            return ModelResponse(
+                'THOUGHT: x\nFINAL: {"answer":"x","claims":[],"citations":[],"abstain":true}',
+                10,
+                10,
+            )
+
+    trace = Trace(run_id="real-user-turn", seed=SEED)
+    tools = Tools(CORPUS, trace, seed=SEED, flaky=False)
+    model = RecordingReal()
+    ReActAgent(model, tools, trace, corpus=CORPUS).run(
+        {
+            "question_vi": "Câu hỏi tổng quát",
+            "is_contradiction": True,
+            "budget": {"max_tool_calls": 8},
+        }
+    )
+
+    user_turn = model.messages[1]["content"]
+    assert user_turn.startswith("Câu hỏi tổng quát")
+    assert "Brief xác nhận có nguồn mâu thuẫn" in user_turn
+    assert "đọc và trích cả hai phía" in user_turn
+
+
+def test_mock_user_turn_remains_the_original_question():
+    agent, _, _ = _agent()
+    agent.run(BRIEF_SLA)
+
+    assert agent.last_context.messages[1]["content"] == BRIEF_SLA["question_vi"]
+
+
+def test_real_model_search_uses_ten_results_but_mock_keeps_five():
+    from arena.model import RealModel
+
+    class ScriptedReal(RealModel):
+        def __init__(self):
+            super().__init__("https://example.invalid/v1", "key", "model")
+            self.turns = 0
+
+        def complete(self, messages, **kw):
+            self.turns += 1
+            text = (
+                'THOUGHT: tìm\nACTION: {"tool":"search","args":{"query":"x","k":5}}'
+                if self.turns == 1
+                else 'THOUGHT: xong\nFINAL: {"answer":"x","claims":[],"citations":[],"abstain":true}'
+            )
+            return ModelResponse(text, 10, 10)
+
+    def search_k(model):
+        trace = Trace(run_id="search-k", seed=SEED)
+        tools = Tools(CORPUS, trace, seed=SEED, flaky=False)
+        ReActAgent(model, tools, trace, corpus=CORPUS).run(
+            {"question_vi": "x", "budget": {"max_tool_calls": 8}}
+        )
+        return next(
+            event["k"] for event in _events(trace.to_jsonl())
+            if event["event"] == "tool_call" and event["name"] == "search"
+        )
+
+    assert search_k(ScriptedReal()) == 10
+    assert search_k(MockModel(CORPUS, SEED)) == 5
+
+
+def test_a_direct_real_model_gets_the_addendum_automatically():
+    from arena.model import RealModel
+
+    trace = Trace(run_id="real-prompt", seed=SEED)
+    tools = Tools(CORPUS, trace, seed=SEED, flaky=False)
+    model = RealModel("https://example.invalid/v1", "key", "model")
+    agent = ReActAgent(model, tools, trace, corpus=CORPUS)
+
+    assert agent.system_prompt.count(REAL_MODEL_PROMPT_ADDENDUM.strip()) == 1
+
+
+def test_a_runner_wrapped_real_model_gets_the_addendum_once():
+    from arena.model import RealModel
+
+    class Wrapper:
+        def __init__(self, inner):
+            self.inner = inner
+
+    trace = Trace(run_id="wrapped-real-prompt", seed=SEED)
+    tools = Tools(CORPUS, trace, seed=SEED, flaky=False)
+    model = Wrapper(RealModel("https://example.invalid/v1", "key", "model"))
+    agent = ReActAgent(model, tools, trace, corpus=CORPUS)
+
+    assert agent.system_prompt.count(REAL_MODEL_PROMPT_ADDENDUM.strip()) == 1
 
 
 # The build tree measures one more thing here that this bundle cannot:

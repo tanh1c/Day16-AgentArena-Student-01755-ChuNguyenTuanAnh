@@ -57,14 +57,43 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] nằm trong body của nó
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] in doc.body
-        #     -> đó là nguồn thật. Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            doc_id = claim.get("doc_id")
+            if not isinstance(text, str):
+                continue
+            cited = ctx.corpus.get(doc_id) if isinstance(doc_id, str) else None
+            if (
+                cited
+                and any(cited.body in observation for observation in ctx.observations)
+                and any(text in line for line in cited.body.splitlines())
+            ):
+                continue
+            source = next(
+                (
+                    doc
+                    for doc in ctx.corpus.docs
+                    if any(doc.body in observation for observation in ctx.observations)
+                    and any(text in line for line in doc.body.splitlines())
+                ),
+                None,
+            )
+            if source:
+                claim["doc_id"] = source.doc_id
+            else:
+                claim.pop("doc_id", None)
+
+        report["citations"] = sorted(
+            {
+                claim["doc_id"]
+                for claim in claims
+                if isinstance(claim, dict) and isinstance(claim.get("doc_id"), str)
+            }
+        )
+        return report
